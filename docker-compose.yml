@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  zemberek:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tr-lemmatizer-zemberek:1.0.0
+    container_name: zemberek
+    ports: ["8077:8077"]
+    restart: unless-stopped
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-11-openjdk-amd64
+    volumes:
+      # Mount Zemberek JAR file if it exists locally
+      - ./zemberek-full.jar:/srv/zemberek-full.jar:ro
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          python - <<'PY'
+          import urllib.request,sys
+          try: 
+            urllib.request.urlopen('http://localhost:8077/health',timeout=10)
+            sys.exit(0)
+          except Exception: 
+            sys.exit(1)
+          PY
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 512M
