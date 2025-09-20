@@ -79,9 +79,16 @@ def zemberek_lemmatize_text(text: str) -> str:
                 # Handle UNK tokens - keep original word as is, but continue processing other words
                 if best_lemma == "UNK" or best_lemma == "Unknown":
                     lemmas.append(surface_form)  # Keep UNK word as original
+                # Check for meaningful passive forms that should be preserved
+                elif _is_meaningful_passive_form(surface_form, [str(lemma_list.get(j)) for j in range(lemma_list.size())]):
+                    lemmas.append(surface_form)  # Keep meaningful passive forms
                 # Check for incorrect lemmatization corrections
                 elif _should_correct_lemma(surface_form, best_lemma):
                     lemmas.append(surface_form)  # Use original form for incorrect lemmas
+                # Normalize institutional terms to base form, preserve others
+                elif _is_institutional_term(surface_form, best_lemma):
+                    normalized_form = _normalize_institutional_term(surface_form, best_lemma)
+                    lemmas.append(normalized_form)  # Use normalized form
                 # Legal mode: preserve adjectives and proper nouns
                 elif _should_preserve_legal(surface_form, best_lemma, pos):
                     lemmas.append(surface_form)  # Keep original form
@@ -104,6 +111,7 @@ def _select_best_lemma(lemma_candidates: List[str], surface_form: str) -> str:
     
     if len(lemma_candidates) == 1:
         return lemma_candidates[0]
+    
     
     # Strategy 1: Prefer longer lemmas (usually more meaningful)
     # Strategy 2: Avoid very short lemmas that might be stems
@@ -135,6 +143,31 @@ def _select_best_lemma(lemma_candidates: List[str], surface_form: str) -> str:
     # Return the highest scoring lemma
     best_lemma = max(scored_lemmas, key=lambda x: x[1])[0]
     return best_lemma
+
+
+def _is_meaningful_passive_form(surface_form: str, lemma_candidates: List[str]) -> bool:
+    """Check if a passive form should be preserved because it has distinct meaning"""
+    
+    # Meaningful passive forms that should be preserved (specific list only)
+    meaningful_passives = {
+        'kazanılmış',  # earned (vs kazan = cauldron)
+        'yapılmış',    # made/done 
+        'alınmış',     # taken
+        'verilmiş',    # given
+        'bulunmuş',    # found
+        'görülmüş',    # seen
+        'duyulmuş',    # heard
+        'bilinmiş',    # known
+        'sevilmiş',    # loved
+        'sayılmış',    # counted/respected
+        'doldurmamış', # not filled/verb
+        # Add more as needed - but be specific!
+    }
+    
+    surface_lower = surface_form.lower()
+    
+    # Only check the explicit list - no heuristics that could interfere
+    return surface_lower in meaningful_passives
 
 
 def _should_correct_lemma(surface_form: str, lemma: str) -> bool:
@@ -192,9 +225,7 @@ def _should_preserve_legal(surface_form: str, lemma: str, pos: str) -> bool:
     if pos == "Propn":
         return True
 
-    # Preserve institutional and official terms
-    if _is_institutional_term(surface_form, lemma):
-        return True
+    # Institutional terms are handled separately now
 
     # Check for potential adjectives based on morphological patterns
     if _is_likely_adjective(surface_form, lemma):
@@ -204,23 +235,26 @@ def _should_preserve_legal(surface_form: str, lemma: str, pos: str) -> bool:
     if pos == "Noun" and len(lemma) < len(surface_form) * 0.5 and len(surface_form) > 10:
         return True
 
+    # Don't skip verbs completely - some might need preservation
+    # But allow normal lemmatization for most verbs
+
     # For other cases, use lemma
     return False
 
 
 def _is_institutional_term(surface_form: str, lemma: str) -> bool:
-    """Check if a word is an institutional/official term that should be preserved"""
+    """Check if a word is an institutional/official term that should be normalized to base form"""
     
-    # Official institution suffixes that should be preserved
+    # Official institution suffixes - normalize these to base form (lığı)
     institutional_suffixes = [
-        'lığı', 'liği', 'luğu', 'lüğü',  # bakanlığı, müdürlüğü
-        'lığa', 'liğe', 'luğa', 'lüğe',  # bakanlığa, müdürlüğe  
-        'lığın', 'liğin', 'luğun', 'lüğün',  # bakanlığın, müdürlüğün
-        'lığından', 'liğinden', 'luğundan', 'lüğünden',  # bakanlığından
-        'lığına', 'liğine', 'luğuna', 'lüğüne',  # bakanlığına
+        'lığa', 'liğe', 'luğa', 'lüğe',  # bakanlığa -> bakanlığı
+        'lığın', 'liğin', 'luğun', 'lüğün',  # bakanlığın -> bakanlığı
+        'lığından', 'liğinden', 'luğundan', 'lüğünden',  # bakanlığından -> bakanlığı
+        'lığına', 'liğine', 'luğuna', 'lüğüne',  # bakanlığına -> bakanlığı
+        'lığınca', 'liğince', 'luğunca', 'lüğünce',  # bakanlığınca -> bakanlığı
     ]
     
-    # Check if surface form ends with institutional suffixes
+    # Check if surface form ends with institutional suffixes that need normalization
     surface_lower = surface_form.lower()
     for suffix in institutional_suffixes:
         if surface_lower.endswith(suffix):
@@ -228,7 +262,39 @@ def _is_institutional_term(surface_form: str, lemma: str) -> bool:
             if lemma.lower().endswith(('lık', 'lik', 'luk', 'lük')):
                 return True
     
+    # Base forms (lığı, liği, luğu, lüğü) should be preserved as is
+    base_suffixes = ['lığı', 'liği', 'luğu', 'lüğü']
+    for suffix in base_suffixes:
+        if surface_lower.endswith(suffix):
+            if lemma.lower().endswith(('lık', 'lik', 'luk', 'lük')):
+                return True
+    
     return False
+
+
+def _normalize_institutional_term(surface_form: str, lemma: str) -> str:
+    """Normalize institutional terms to their base form (lığı)"""
+    
+    # Map various institutional suffixes to base form
+    suffix_mappings = {
+        'lığa': 'lığı', 'liğe': 'liği', 'luğa': 'luğu', 'lüğe': 'lüğü',
+        'lığın': 'lığı', 'liğin': 'liği', 'luğun': 'luğu', 'lüğün': 'lüğü',
+        'lığından': 'lığı', 'liğinden': 'liği', 'luğundan': 'luğu', 'lüğünden': 'lüğü',
+        'lığına': 'lığı', 'liğine': 'liği', 'luğuna': 'luğu', 'lüğüne': 'lüğü',
+        'lığınca': 'lığı', 'liğince': 'liği', 'luğunca': 'luğu', 'lüğünce': 'lüğü',
+    }
+    
+    surface_lower = surface_form.lower()
+    
+    # Find the suffix and replace with base form
+    for old_suffix, new_suffix in suffix_mappings.items():
+        if surface_lower.endswith(old_suffix):
+            # Replace the suffix
+            base_form = surface_form[:-len(old_suffix)] + new_suffix
+            return base_form
+    
+    # If no mapping found, return original
+    return surface_form
 
 
 def _is_likely_adjective(surface_form: str, lemma: str) -> bool:
