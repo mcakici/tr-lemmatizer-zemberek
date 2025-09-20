@@ -62,8 +62,13 @@ def zemberek_lemmatize_text(text: str) -> str:
             lemma_list = analysis_item.getLemmas()
 
             if lemma_list and lemma_list.size() > 0:
-                # Get the best lemma based on context
-                best_lemma = str(lemma_list.get(0))
+                # Get the best lemma based on context - prefer longer, more meaningful lemmas
+                if lemma_list.size() == 1:
+                    best_lemma = str(lemma_list.get(0))
+                else:
+                    # Multiple lemmas available - choose the most appropriate one
+                    lemma_candidates = [str(lemma_list.get(j)) for j in range(lemma_list.size())]
+                    best_lemma = _select_best_lemma(lemma_candidates, str(analysis_item.surfaceForm()))
                 surface_form = str(analysis_item.surfaceForm())
                 pos = (
                     str(analysis_item.getPos())
@@ -71,11 +76,14 @@ def zemberek_lemmatize_text(text: str) -> str:
                     else ""
                 )
 
+                # Handle UNK tokens - keep original word as is, but continue processing other words
+                if best_lemma == "UNK" or best_lemma == "Unknown":
+                    lemmas.append(surface_form)  # Keep UNK word as original
                 # Legal mode: preserve adjectives and proper nouns
-                if _should_preserve_legal(surface_form, best_lemma, pos):
+                elif _should_preserve_legal(surface_form, best_lemma, pos):
                     lemmas.append(surface_form)  # Keep original form
                 else:
-                    lemmas.append(best_lemma)
+                    lemmas.append(best_lemma)  # Use lemmatized form
             else:
                 # Fallback to the original token
                 lemmas.append(str(analysis_item.surfaceForm()))
@@ -86,8 +94,48 @@ def zemberek_lemmatize_text(text: str) -> str:
         raise
 
 
+def _select_best_lemma(lemma_candidates: List[str], surface_form: str) -> str:
+    """Select the best lemma from multiple candidates"""
+    if not lemma_candidates:
+        return surface_form
+    
+    if len(lemma_candidates) == 1:
+        return lemma_candidates[0]
+    
+    # Strategy 1: Prefer longer lemmas (usually more meaningful)
+    # Strategy 2: Avoid very short lemmas that might be stems
+    # Strategy 3: Prefer lemmas that are closer to the surface form
+    
+    # Filter out very short lemmas (likely stems)
+    meaningful_lemmas = [lemma for lemma in lemma_candidates if len(lemma) >= 3]
+    if not meaningful_lemmas:
+        meaningful_lemmas = lemma_candidates
+    
+    # If we have only one meaningful lemma, return it
+    if len(meaningful_lemmas) == 1:
+        return meaningful_lemmas[0]
+    
+    # Score each lemma based on length and similarity to surface form
+    scored_lemmas = []
+    for lemma in meaningful_lemmas:
+        # Length score (prefer longer lemmas)
+        length_score = len(lemma) / max(len(l) for l in meaningful_lemmas)
+        
+        # Similarity score (prefer lemmas that share more characters with surface form)
+        common_chars = len(set(lemma.lower()) & set(surface_form.lower()))
+        similarity_score = common_chars / max(len(surface_form), len(lemma))
+        
+        # Combined score
+        total_score = length_score * 0.7 + similarity_score * 0.3
+        scored_lemmas.append((lemma, total_score))
+    
+    # Return the highest scoring lemma
+    best_lemma = max(scored_lemmas, key=lambda x: x[1])[0]
+    return best_lemma
+
+
 def _should_preserve_legal(surface_form: str, lemma: str, pos: str) -> bool:
-    """Legal mode: preserve adjectives and proper nouns based on morphological analysis"""
+    """Legal mode: preserve adjectives, proper nouns, and institutional terms"""
 
     # Always preserve adjectives
     if pos == "Adj":
@@ -97,15 +145,42 @@ def _should_preserve_legal(surface_form: str, lemma: str, pos: str) -> bool:
     if pos == "Propn":
         return True
 
+    # Preserve institutional and official terms
+    if _is_institutional_term(surface_form, lemma):
+        return True
+
     # Check for potential adjectives based on morphological patterns
     if _is_likely_adjective(surface_form, lemma):
         return True
 
-    # For compound nouns, preserve if lemma is significantly shorter
-    if pos == "Noun" and len(lemma) < len(surface_form) * 0.7:
+    # For compound nouns, preserve if lemma is significantly shorter (real compounds)
+    if pos == "Noun" and len(lemma) < len(surface_form) * 0.5 and len(surface_form) > 10:
         return True
 
     # For other cases, use lemma
+    return False
+
+
+def _is_institutional_term(surface_form: str, lemma: str) -> bool:
+    """Check if a word is an institutional/official term that should be preserved"""
+    
+    # Official institution suffixes that should be preserved
+    institutional_suffixes = [
+        'lığı', 'liği', 'luğu', 'lüğü',  # bakanlığı, müdürlüğü
+        'lığa', 'liğe', 'luğa', 'lüğe',  # bakanlığa, müdürlüğe  
+        'lığın', 'liğin', 'luğun', 'lüğün',  # bakanlığın, müdürlüğün
+        'lığından', 'liğinden', 'luğundan', 'lüğünden',  # bakanlığından
+        'lığına', 'liğine', 'luğuna', 'lüğüne',  # bakanlığına
+    ]
+    
+    # Check if surface form ends with institutional suffixes
+    surface_lower = surface_form.lower()
+    for suffix in institutional_suffixes:
+        if surface_lower.endswith(suffix):
+            # Additional check: lemma should end with 'lık/lik/luk/lük'
+            if lemma.lower().endswith(('lık', 'lik', 'luk', 'lük')):
+                return True
+    
     return False
 
 
