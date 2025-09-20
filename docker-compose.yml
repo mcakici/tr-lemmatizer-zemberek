@@ -10,9 +10,8 @@ services:
     ports: ["8077:8077"]
     restart: unless-stopped
     environment:
-      JAVA_HOME: /usr/lib/jvm/java-11-openjdk-amd64
+      JAVA_HOME: /opt/java/openjdk
     volumes:
-      # Mount Zemberek JAR file if it exists locally
       - ./zemberek-full.jar:/srv/zemberek-full.jar:ro
     healthcheck:
       test:
