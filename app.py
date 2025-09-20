@@ -79,6 +79,9 @@ def zemberek_lemmatize_text(text: str) -> str:
                 # Handle UNK tokens - keep original word as is, but continue processing other words
                 if best_lemma == "UNK" or best_lemma == "Unknown":
                     lemmas.append(surface_form)  # Keep UNK word as original
+                # Check for incorrect lemmatization corrections
+                elif _should_correct_lemma(surface_form, best_lemma):
+                    lemmas.append(surface_form)  # Use original form for incorrect lemmas
                 # Legal mode: preserve adjectives and proper nouns
                 elif _should_preserve_legal(surface_form, best_lemma, pos):
                     lemmas.append(surface_form)  # Keep original form
@@ -132,6 +135,50 @@ def _select_best_lemma(lemma_candidates: List[str], surface_form: str) -> str:
     # Return the highest scoring lemma
     best_lemma = max(scored_lemmas, key=lambda x: x[1])[0]
     return best_lemma
+
+
+def _should_correct_lemma(surface_form: str, lemma: str) -> bool:
+    """Check if the lemmatization is incorrect and should be corrected"""
+    
+    # Known incorrect lemmatizations that should use the original form
+    incorrect_lemmas = {
+        'hurda': 'hurd',  # hurda should remain hurda, not become hurd
+        # Add more known incorrect cases here as they are discovered
+    }
+    
+    # Check if this is a known incorrect lemmatization
+    surface_lower = surface_form.lower()
+    lemma_lower = lemma.lower()
+    
+    if surface_lower in incorrect_lemmas:
+        if incorrect_lemmas[surface_lower] == lemma_lower:
+            return True  # This is a known incorrect lemmatization
+    
+    # Additional heuristics for detecting incorrect lemmatizations
+    # If lemma is significantly shorter and doesn't make sense linguistically
+    if len(lemma) < len(surface_form) - 2 and len(lemma) < 5:
+        # Check if removing common suffixes would result in the lemma
+        # This catches cases like "hurda" -> "hurd" where "a" is incorrectly treated as suffix
+        common_suffixes = ['a', 'e', 'ı', 'i', 'o', 'ö', 'u', 'ü']
+        for suffix in common_suffixes:
+            if surface_form.lower().endswith(suffix) and surface_form.lower()[:-1] == lemma_lower:
+                # If the word is likely a standalone word (not a real inflection)
+                if _is_likely_standalone_word(surface_form):
+                    return True
+    
+    return False
+
+
+def _is_likely_standalone_word(word: str) -> bool:
+    """Check if a word is likely a standalone word rather than an inflected form"""
+    
+    # Common standalone words that might be misanalyzed
+    standalone_words = {
+        'hurda', 'karda', 'yurda', 'barda', 'perde', 'erde', 'çerde',
+        # Add more as needed
+    }
+    
+    return word.lower() in standalone_words
 
 
 def _should_preserve_legal(surface_form: str, lemma: str, pos: str) -> bool:
