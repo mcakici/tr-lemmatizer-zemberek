@@ -11,6 +11,16 @@ services:
     restart: unless-stopped
     environment:
       JAVA_HOME: /opt/java/openjdk
+      # JVM optimization
+      JAVA_OPTS: "-Xmx1g -Xms512m -XX:+UseG1GC -XX:MaxGCPauseMillis=50"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1.5G
+        reservations:
+          cpus: '1.0'
+          memory: 512M
     healthcheck:
       test:
         - "CMD-SHELL"
@@ -27,10 +37,4 @@ services:
       timeout: 15s
       retries: 5
       start_period: 60s
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 1G
-        reservations:
-          memory: 512M
+      

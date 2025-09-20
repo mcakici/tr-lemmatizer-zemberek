@@ -4,7 +4,12 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     JAVA_HOME=/opt/java/openjdk \
-    PATH="/opt/java/openjdk/bin:${PATH}"
+    PATH="/opt/java/openjdk/bin:${PATH}" \
+    # JVM optimization
+    JAVA_OPTS="-Xmx1g -Xms512m -XX:+UseG1GC -XX:MaxGCPauseMillis=50" \
+    # Python optimization
+    PYTHONOPTIMIZE=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /srv
 

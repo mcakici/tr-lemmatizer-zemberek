@@ -1,7 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union
-import functools, re, logging, os
+from typing import List, Dict, Any, Union
+import logging, os
+import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import multiprocessing
 
 # JPype for Zemberek integration
 from jpype import startJVM, getDefaultJVMPath, JClass, isJVMStarted
@@ -13,6 +18,18 @@ app = FastAPI(title="TR Lemmatizer (Zemberek)")
 
 # Zemberek integration
 _zemberek_morphology = None
+
+# Performance optimization settings
+BATCH_SIZE = 100  # Process texts in batches (optimized for memory)
+MAX_WORKERS = 2   # Number of parallel workers (Zemberek thread-safe limit)
+CACHE_SIZE = 25000  # LRU cache size (optimized for 20k requests)
+PARALLEL_THRESHOLD = 200  # Only use parallel processing for >200 texts
+SINGLE_THREAD_THRESHOLD = 50  # Use single thread for <50 texts
+
+# Global thread pool for parallel processing
+_thread_pool = None
+
+# Thread pool for parallel processing
 
 
 def init_zemberek():
@@ -27,8 +44,16 @@ def init_zemberek():
 
         # Start JVM if not already started
         if not isJVMStarted():
-            # Simple JVM startup with just Zemberek jar
-            startJVM(getDefaultJVMPath(), f"-Djava.class.path={zemberek_jar}")
+            # Optimized JVM startup with memory settings
+            jvm_args = [
+                f"-Djava.class.path={zemberek_jar}",
+                "-Xmx512m",  # Max heap size
+                "-Xms256m",  # Initial heap size
+                "-XX:+UseG1GC",  # Use G1 garbage collector
+                "-XX:MaxGCPauseMillis=50",  # Target GC pause time
+                "-Djava.awt.headless=true"  # Headless mode
+            ]
+            startJVM(getDefaultJVMPath(), *jvm_args)
 
         # Initialize Zemberek morphology
         TurkishMorphology = JClass("zemberek.morphology.TurkishMorphology")
@@ -36,13 +61,107 @@ def init_zemberek():
         log.info("Zemberek initialized successfully")
         return True
     except Exception as e:
-        log.error(f"Failed to initialize Zemberek: {e}")
+        log.error("Failed to initialize Zemberek: %s", e)
         raise
 
 
 def get_zemberek_morphology():
     """Get Zemberek morphology instance"""
     return _zemberek_morphology
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def _cached_lemmatize_text(text: str) -> str:
+    """Cached version of lemmatization - thread-safe with Zemberek"""
+    return zemberek_lemmatize_text(text)
+
+
+def _get_cache_stats() -> Dict[str, Any]:
+    """Get cache statistics"""
+    cache_info = _cached_lemmatize_text.cache_info()
+    return {
+        "hits": cache_info.hits,
+        "misses": cache_info.misses,
+        "current_size": cache_info.currsize,
+        "max_size": cache_info.maxsize,
+        "hit_rate": cache_info.hits / (cache_info.hits + cache_info.misses) if (cache_info.hits + cache_info.misses) > 0 else 0
+    }
+
+
+def _process_batch(texts: List[str], return_details: bool = False) -> Dict[str, Any]:
+    """Process a batch of texts using cached lemmatization"""
+    lemmas = []
+    details = []
+    
+    for text in texts:
+        try:
+            # Use cached lemmatization for better performance
+            lemmatized_text = _cached_lemmatize_text(text)
+            lemmas.append(lemmatized_text)
+            
+            if return_details:
+                analyses = zemberek_analyze(text)
+                details.append({
+                    "input": text,
+                    "lemma": lemmatized_text,
+                    "analyses": analyses,
+                    "engine": "zemberek-legal-cached",
+                })
+        except Exception as e:
+            log.warning("Failed to lemmatize text '%s': %s", text, e)
+            lemmas.append(text)  # Fallback to original
+            if return_details:
+                details.append({
+                    "input": text,
+                    "lemma": text,
+                    "analyses": [],
+                    "engine": "fallback",
+                    "error": str(e),
+                })
+    
+    return {"lemmas": lemmas, "details": details}
+
+
+def _split_into_batches(texts: List[str], batch_size: int = BATCH_SIZE) -> List[List[str]]:
+    """Split texts into batches for parallel processing"""
+    return [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+
+
+async def _process_batches_with_thread_pool(texts: List[str], return_details: bool = False) -> Dict[str, Any]:
+    """Process multiple batches in parallel using thread pool (Zemberek compatible)"""
+    global _thread_pool
+    
+    if _thread_pool is None:
+        _thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    
+    # Split texts into batches
+    batches = _split_into_batches(texts)
+    
+    # Process batches in parallel using thread pool
+    loop = asyncio.get_event_loop()
+    futures = []
+    
+    for batch in batches:
+        future = loop.run_in_executor(_thread_pool, _process_batch, batch, return_details)
+        futures.append(future)
+    
+    # Wait for all batches to complete
+    batch_results = await asyncio.gather(*futures)
+    
+    # Combine results
+    all_lemmas = []
+    all_details = []
+    
+    for batch_result in batch_results:
+        all_lemmas.extend(batch_result["lemmas"])
+        if return_details:
+            all_details.extend(batch_result["details"])
+    
+    result = {"lemmas": all_lemmas}
+    if return_details:
+        result["details"] = all_details
+    
+    return result
 
 
 def zemberek_lemmatize_text(text: str) -> str:
@@ -111,7 +230,7 @@ def zemberek_lemmatize_text(text: str) -> str:
 
         return " ".join(lemmas)
     except Exception as e:
-        log.error(f"Zemberek lemmatization failed: {e}")
+        log.error("Zemberek lemmatization failed: %s", e)
         raise
 
 
@@ -173,6 +292,7 @@ def _is_meaningful_passive_form(surface_form: str, lemma_candidates: List[str]) 
         "doldurmamış",  # not filled/verb
         "edinilen",  # done/verb
         "edinilmiş",  # done/verb
+        "kalem", 
         # Add more as needed - but be specific!
     }
 
@@ -207,7 +327,7 @@ def _normalize_unk_word(word: str) -> str:
     return word
 
 
-def _get_corrected_lemma(surface_form: str, incorrect_lemma: str) -> str:
+def _get_corrected_lemma(surface_form: str, _incorrect_lemma: str) -> str:
     """Get the corrected lemma for known incorrect cases"""
     
     # Special corrections where we need a specific lemma, not just the original word
@@ -361,7 +481,7 @@ def _is_institutional_term(surface_form: str, lemma: str) -> bool:
     return False
 
 
-def _normalize_institutional_term(surface_form: str, lemma: str) -> str:
+def _normalize_institutional_term(surface_form: str, _lemma: str) -> str:
     """Normalize institutional terms to their base form (lığı)"""
 
     # Map various institutional suffixes to base form
@@ -486,13 +606,33 @@ class LemReq(BaseModel):
 
 @app.on_event("startup")
 async def warmup():
+    global _thread_pool
     try:
         log.info("Initializing Zemberek...")
         init_zemberek()
+        
+        # Initialize thread pool for small concurrent operations
+        _thread_pool = ThreadPoolExecutor(max_workers=2)
+        log.info("Thread pool initialized with 2 workers")
+        
+        # Log system info
+        cpu_count = multiprocessing.cpu_count()
+        log.info("System CPU count: %d", cpu_count)
+        log.info("Max workers configured: %d", MAX_WORKERS)
+        
         log.info("Zemberek warmup complete.")
     except Exception as e:
         log.exception("Warmup failed: %s", e)
         raise
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _thread_pool
+    if _thread_pool:
+        log.info("Shutting down thread pool...")
+        _thread_pool.shutdown(wait=True)
+        _thread_pool = None
 
 
 @app.get("/health")
@@ -501,8 +641,8 @@ def health():
 
 
 @app.post("/lemmatize")
-def lemmatize(req: LemReq) -> Dict[str, Any]:
-    """Lemmatize single text or multiple n-grams (bigram, trigram, etc.)"""
+async def lemmatize(req: LemReq) -> Dict[str, Any]:
+    """Lemmatize single text or multiple n-grams with optimized parallel processing"""
     try:
         # Handle both single string and list of strings
         if isinstance(req.texts, str):
@@ -513,59 +653,145 @@ def lemmatize(req: LemReq) -> Dict[str, Any]:
         if not texts_to_process:
             return {"lemmas": [], "details": []}
 
-        lemmas = []
-        details = []
+        # Performance logging
+        start_time = time.time()
+        log.info("Lemmatization API çağrısı (%d n-gram)...", len(texts_to_process))
 
-        for text in texts_to_process:
-            try:
-                # Lemmatize each text (n-gram) separately
-                lemmatized_text = zemberek_lemmatize_text(text)
-                lemmas.append(lemmatized_text)
+        # Choose processing strategy based on input size
+        if len(texts_to_process) == 1:
+            # Single text - use direct processing
+            result = await _process_single_text_direct(texts_to_process[0], req.return_details)
+        elif len(texts_to_process) <= SINGLE_THREAD_THRESHOLD:
+            # Small batch - use direct processing (no overhead)
+            result = _process_batch_direct(texts_to_process, req.return_details)
+        elif len(texts_to_process) <= PARALLEL_THRESHOLD:
+            # Medium batch - use cached processing
+            result = _process_batch(texts_to_process, req.return_details)
+        else:
+            # Large batch - use thread pool (Zemberek compatible)
+            result = await _process_batches_with_thread_pool(texts_to_process, req.return_details)
 
-                if req.return_details:
-                    analyses = zemberek_analyze(text)
-                    details.append(
-                        {
-                            "input": text,
-                            "lemma": lemmatized_text,
-                            "analyses": analyses,
-                            "engine": "zemberek-legal",
-                        }
-                    )
-            except Exception as e:
-                log.warning(f"Failed to lemmatize text '{text}': {e}")
-                lemmas.append(text)  # Fallback to original
-                if req.return_details:
-                    details.append(
-                        {
-                            "input": text,
-                            "lemma": text,
-                            "analyses": [],
-                            "engine": "fallback",
-                            "error": str(e),
-                        }
-                    )
-
-        result = {"lemmas": lemmas}
+        # Performance logging
+        processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+        log.info("Lemmatization: %.1fms", processing_time)
+        
+        # Add performance metrics to response only if details are requested
         if req.return_details:
-            result["details"] = details
+            cache_stats = _get_cache_stats()
+            result["performance"] = {
+                "processing_time_ms": round(processing_time, 1),
+                "text_count": len(texts_to_process),
+                "batch_size": BATCH_SIZE,
+                "parallel_processing": len(texts_to_process) > BATCH_SIZE,
+                "cache_stats": cache_stats,
+                "cache_size_config": CACHE_SIZE
+            }
 
         return result
     except Exception as e:
         log.exception("lemmatize failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"lemmatize_failed: {e}")
+        raise HTTPException(status_code=500, detail=f"lemmatize_failed: {e}") from e
+
+
+async def _process_single_text_direct(text: str, return_details: bool = False) -> Dict[str, Any]:
+    """Process a single text directly without cache overhead"""
+    try:
+        lemmatized_text = zemberek_lemmatize_text(text)
+        result = {"lemmas": [lemmatized_text]}
+        
+        if return_details:
+            analyses = zemberek_analyze(text)
+            result["details"] = [{
+                "input": text,
+                "lemma": lemmatized_text,
+                "analyses": analyses,
+                "engine": "zemberek-legal-direct",
+            }]
+        
+        return result
+    except Exception as e:
+        log.warning("Failed to lemmatize text '%s': %s", text, e)
+        result = {"lemmas": [text]}
+        if return_details:
+            result["details"] = [{
+                "input": text,
+                "lemma": text,
+                "analyses": [],
+                "engine": "fallback",
+                "error": str(e),
+            }]
+        return result
+
+
+def _process_batch_direct(texts: List[str], return_details: bool = False) -> Dict[str, Any]:
+    """Process a batch directly without threading overhead"""
+    lemmas = []
+    details = []
+    
+    for text in texts:
+        try:
+            # Use direct lemmatization for better performance on small batches
+            lemmatized_text = zemberek_lemmatize_text(text)
+            lemmas.append(lemmatized_text)
+            
+            if return_details:
+                analyses = zemberek_analyze(text)
+                details.append({
+                    "input": text,
+                    "lemma": lemmatized_text,
+                    "analyses": analyses,
+                    "engine": "zemberek-legal-direct",
+                })
+        except Exception as e:
+            log.warning("Failed to lemmatize text '%s': %s", text, e)
+            lemmas.append(text)  # Fallback to original
+            if return_details:
+                details.append({
+                    "input": text,
+                    "lemma": text,
+                    "analyses": [],
+                    "engine": "fallback",
+                    "error": str(e),
+                })
+    
+    result = {"lemmas": lemmas}
+    if return_details:
+        result["details"] = details
+    
+    return result
 
 
 @app.get("/")
 def root():
+    cache_stats = _get_cache_stats()
     return {
         "service": "TR Lemmatizer",
         "engine": "Zemberek",
-        "version": "2.0.0",
-        "description": "Turkish lemmatization (preserves adjectives)",
-        "endpoints": {"health": "/health", "lemmatize": "/lemmatize"},
+        "version": "3.0.0",
+        "description": "Turkish lemmatization with optimized parallel processing",
+        "features": [
+            "Parallel batch processing",
+            f"LRU caching ({CACHE_SIZE:,} entries)",
+            "Async/await support",
+            "Performance metrics",
+            "Legal mode (preserves adjectives)"
+        ],
+        "performance": {
+            "batch_size": BATCH_SIZE,
+            "max_workers": MAX_WORKERS,
+            "cache_size": CACHE_SIZE,
+            "parallel_threshold": PARALLEL_THRESHOLD,
+            "single_thread_threshold": SINGLE_THREAD_THRESHOLD,
+            "cpu_count": multiprocessing.cpu_count(),
+            "cache_stats": cache_stats
+        },
+        "endpoints": {
+            "health": "/health", 
+            "lemmatize": "/lemmatize"
+        },
         "usage": {
             "single_text": '{"texts": "merkezi sistem yönetimi"}',
             "multiple_ngrams": '{"texts": ["merkezi sistem", "idari yaptırım", "kanuni faiz"]}',
+            "large_batch": '{"texts": ["text1", "text2", ...]} // Auto parallel processing for >200 items'
         },
     }
