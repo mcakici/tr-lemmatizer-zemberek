@@ -292,7 +292,8 @@ def _is_meaningful_passive_form(surface_form: str, lemma_candidates: List[str]) 
         "doldurmamış",  # not filled/verb
         "edinilen",  # done/verb
         "edinilmiş",  # done/verb
-        "kalem", 
+        "kalem",
+        "boşanma"
         # Add more as needed - but be specific!
     }
 
